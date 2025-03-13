@@ -208,6 +208,211 @@ def dpm_solver_integrate_with_schedule(
     return x
 
 
+def dpm_solver_integrate_ode(
+    y_0, model, gamma=0.5, steps=20, noise_sample=None, order=2, reverse=False
+):
+    """
+    Integrate controlled ODE using DPMSolver++ (forward or reverse).
+
+    Args:
+        y_0: Initial state tensor [B, C, H, W]
+        model: Pre-trained Flux model
+        gamma: Controller guidance parameter
+        steps: Number of function evaluations
+        noise_sample: Optional fixed noise target (for forward process)
+        order: Order of DPMSolver++ (1, 2, or 3)
+        reverse: If True, perform reverse process (editing); otherwise forward (inversion)
+
+    Returns:
+        Final state after integration
+    """
+    device = y_0.device
+    x = y_0.clone()
+
+    # For forward process, fix target noise
+    if not reverse:
+        if noise_sample is None:
+            y_target = torch.randn_like(y_0)
+        else:
+            y_target = noise_sample
+    else:
+        # For reverse process, original image is the target
+        y_target = y_0
+
+    # Time steps in log-space for better performance
+    # For reverse process, time goes from 0 to 1; for forward, 1 to 0
+    if reverse:
+        timesteps = torch.linspace(0, 1, steps + 1, device=device)
+    else:
+        timesteps = torch.linspace(0, 1, steps + 1, device=device)
+
+    # Storage for model outputs at different time steps
+    model_output_list = []
+    time_list = []
+
+    # DPMSolver++ algorithm
+    for i in range(steps):
+        # Current and next time
+        t = timesteps[i]
+        t_next = timesteps[i + 1]
+
+        if reverse:
+            # Reverse process (Eq. 15) - editing
+            # Get unconditional reverse vector field
+            v_t = -unconditional_vector_field(x, 1 - t, model)
+
+            # Conditional vector field
+            v_t_cond = (y_target - x) / (1.0 - t)
+
+            # Controlled vector field
+            controlled_drift = v_t + gamma * (v_t_cond - v_t)
+        else:
+            # Forward process (Eq. 8) - inversion
+            # Unconditional vector field
+            u_t = unconditional_vector_field(x, t, model)
+
+            # Conditional vector field
+            u_t_cond = (y_target - x) / (1.0 - t)
+
+            # Controlled vector field
+            controlled_drift = u_t + gamma * (u_t_cond - u_t)
+
+        # Store for multi-step methods
+        model_output_list.append(controlled_drift)
+        time_list.append(t)
+
+        # Apply DPMSolver++ update
+        if len(model_output_list) >= order:
+            x = dpm_solver_update(x, model_output_list, time_list, t_next, order)
+
+            # Keep only what's needed for next step
+            if order == 1:
+                model_output_list = []
+                time_list = []
+            else:
+                model_output_list = model_output_list[-(order - 1) :]
+                time_list = time_list[-(order - 1) :]
+        else:
+            # First-order update when we don't have enough previous steps
+            dt = t_next - t
+            x = x + controlled_drift * dt
+
+    return x
+
+
+def dpm_solver_integrate_sde(
+    y_0, model, gamma=0.5, steps=20, noise_sample=None, order=2, reverse=False
+):
+    """
+    Integrate controlled SDE using DPMSolver++ with noise (forward or reverse).
+
+    Args:
+        y_0: Initial state tensor [B, C, H, W]
+        model: Pre-trained Flux model
+        gamma: Controller guidance parameter
+        steps: Number of function evaluations
+        noise_sample: Optional fixed noise target (for forward process)
+        order: Order of DPMSolver++ (1, 2, or 3)
+        reverse: If True, perform reverse process (editing); otherwise forward (inversion)
+
+    Returns:
+        Final state after integration
+    """
+    device = y_0.device
+    x = y_0.clone()
+
+    # For forward process, fix target noise
+    if not reverse:
+        if noise_sample is None:
+            y_target = torch.randn_like(y_0)
+        else:
+            y_target = noise_sample
+    else:
+        # For reverse process, original image is the target
+        y_target = y_0
+
+    # Time steps
+    if reverse:
+        timesteps = torch.linspace(0, 1, steps + 1, device=device)
+    else:
+        timesteps = torch.linspace(0, 1, steps + 1, device=device)
+
+    # Storage for model outputs and diffusion terms
+    model_output_list = []
+    diffusion_list = []
+    time_list = []
+
+    # DPMSolver++ algorithm with SDE terms
+    for i in range(steps):
+        # Current and next time
+        t = timesteps[i]
+        t_next = timesteps[i + 1]
+        dt = t_next - t
+
+        if reverse:
+            # Reverse process SDE (Eq. 17)
+            # Calculate score using Flux model
+            score = (1 - t) / t * unconditional_vector_field(
+                x, 1 - t, model
+            ) + 1 / t * x
+
+            # Drift term
+            drift = (
+                (1 - t - gamma) * x / (t * (1 - t))
+                + gamma * y_target / (1 - t)
+                + 2 * (1 - t) * (1 - gamma) / t * score
+            )
+
+            # Diffusion coefficient
+            diffusion = torch.sqrt(torch.tensor(2.0 * (1 - t) * (1 - gamma) / t))
+        else:
+            # Forward process SDE (Eq. 10)
+            # Calculate score using Flux model
+            score = -1 / t * x - (1 - t) / t * unconditional_vector_field(x, t, model)
+
+            # Drift term
+            drift = (
+                -1 / (1 - t) * (x - gamma * y_target)
+                - (1 - gamma) * t / (1 - t) * score
+            )
+
+            # Diffusion coefficient
+            diffusion = torch.sqrt(torch.tensor(2.0 * (1 - gamma) * t / (1 - t)))
+
+        # Store for multi-step methods
+        model_output_list.append(drift)
+        diffusion_list.append(diffusion)
+        time_list.append(t)
+
+        # Generate random noise
+        noise = torch.randn_like(x) * torch.sqrt(torch.tensor(dt))
+
+        # Apply deterministic DPMSolver++ update for drift
+        if len(model_output_list) >= order:
+            # Higher-order update for deterministic part
+            x_deterministic = dpm_solver_update(
+                x, model_output_list, time_list, t_next, order
+            )
+
+            # Add stochastic part (always first-order for noise term)
+            x = x_deterministic + diffusion_list[-1] * noise
+
+            # Keep only what's needed for next step
+            if order == 1:
+                model_output_list = []
+                diffusion_list = []
+                time_list = []
+            else:
+                model_output_list = model_output_list[-(order - 1) :]
+                diffusion_list = diffusion_list[-(order - 1) :]
+                time_list = time_list[-(order - 1) :]
+        else:
+            # First-order update when we don't have enough previous steps
+            x = x + drift * dt + diffusion * noise
+
+    return x
+
+
 def invert_and_edit_with_dpm_solver(
     original_img,
     model,

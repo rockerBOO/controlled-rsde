@@ -1,6 +1,7 @@
 import torch
 from . import controlled_vector_field, unconditional_vector_field
 
+
 def euler_integrate_forward(y_0, model, gamma=0.5, steps=100, noise_sample=None):
     """
     Integrate the controlled forward ODE (8) using Euler method.
@@ -177,6 +178,70 @@ def euler_integrate_reverse_with_continuous_schedule(
         x_t = x_t + controlled_drift * dt
 
     return x_t
+
+
+# ODE Implementation (controlled forward ODE - Eq. 8)
+def euler_integrate_forward_ode(
+    y_0, flux_model, gamma=0.5, steps=100, noise_sample=None
+):
+    y_t = y_0.clone()
+
+    # Fix target noise
+    if noise_sample is None:
+        y_1 = torch.randn_like(y_0)
+    else:
+        y_1 = noise_sample
+
+    dt = 1.0 / steps
+
+    for i in range(steps):
+        t = i / steps
+
+        # Calculate drift (controlled vector field)
+        u_t = unconditional_vector_field(y_t, t, flux_model)
+        u_t_cond = (y_1 - y_t) / (1.0 - t)
+        drift = u_t + gamma * (u_t_cond - u_t)
+
+        # Euler step
+        y_t = y_t + drift * dt
+
+    return y_t
+
+
+# SDE Implementation (controlled forward SDE - Eq. 10)
+def euler_maruyama_forward_sde(y_0, model, gamma=0.5, steps=100, noise_sample=None):
+    y_t = y_0.clone()
+    
+    # Fix target noise
+    if noise_sample is None:
+        y_1 = torch.randn_like(y_0)
+    else:
+        y_1 = noise_sample
+    
+    dt = 1.0 / steps
+    
+    for i in range(steps):
+        t = i / steps
+        
+        # Calculate log-probability gradient (score) using Flux model
+        # The paper shows in Lemma A.1 that:
+        # ∇ log pt(Yt) = -1/t * Yt - (1-t)/t * u(Yt, t; φ)
+        score = -1/t * y_t - (1-t)/t * unconditional_vector_field(y_t, t, model)
+        
+        # Calculate drift according to Equation 10
+        drift = -1/(1-t) * (y_t - gamma*y_1) - (1-gamma)*t/(1-t) * score
+        
+        # Calculate diffusion coefficient
+        diffusion = torch.sqrt(torch.tensor(2.0*(1-gamma)*t/(1-t)))
+        
+        # Generate random noise
+        noise = torch.randn_like(y_t) * torch.sqrt(torch.tensor(dt))
+        
+        # Euler-Maruyama step
+        y_t = y_t + drift * dt + diffusion * noise
+        
+    return y_t
+
 
 def invert_and_edit_with_euler(
     original_img, model, edit_prompt, gamma=0.5, eta=0.5, steps=100, eta_schedule=None
