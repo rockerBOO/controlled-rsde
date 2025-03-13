@@ -33,6 +33,18 @@ from controlled_rsde.euler import invert_and_edit_with_euler
 edited_image = invert_and_edit_with_euler(original_img, model, edit_prompt, gamma=0.5, eta=0.5, steps=100, eta_schedule=None)
 ```
 
+## Hyperparameters
+For timestep and gamma strength.
+
+| Task | Start | End | Strength |
+|--------|--------|--------|--------|
+| Stroke2Image | 3 | 5 | 0.9 |
+| Object insert | 0 | 6 | 1.0 |
+| Gender editing | 0 | 8 | 1.0 |
+| Age editing | 0 | 5 | 1.0 |
+| Adding glasses | 6 | 25 | 0.7 |
+| Stylization | 0 | 6 | 0.9 |
+
 [Semantic Image Inversion and Editing using Rectified Stochastic Differential Equations](https://arxiv.org/abs/2410.10792)
 
 ```
