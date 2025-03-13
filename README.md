@@ -1,4 +1,4 @@
-# Controlled ODE
+# Controlled Rectified Stochastic Differential Equations
 
 An AI guided implementation of controlled ODE for Semantic Image Inversion and Editing.
 
